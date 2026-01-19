@@ -1,0 +1,11 @@
+# Uncloud deployment configuration
+# Deploy with: uncloud deploy
+
+services:
+  fractalzoomer:
+    image: ghcr.io/justy/fractalzoomer:latest
+    x-ports:
+      - fractalzoomer.justy.me:80/https
+    environment:
+      - RUST_LOG=info
+      - PORT=8080
