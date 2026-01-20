@@ -1,208 +1,220 @@
-/// WebSocket handler for rendering strip requests
+/// Worker module - connects to coordinator, renders strips
 
-use axum::extract::ws::{Message, WebSocket};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::colour::generate_palette;
 use crate::mandelbrot::render_strip;
+use crate::messages::*;
 
-/// Request message from client
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-#[serde(rename_all = "snake_case")]
-pub enum ClientMessage {
-    Render(RenderRequest),
-    Benchmark(BenchmarkRequest),
-}
+/// Heartbeat interval
+const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 
-#[derive(Debug, Deserialize)]
-pub struct RenderRequest {
-    pub frame_id: u64,
-    pub width: u32,
-    pub y_start: u32,
-    pub y_end: u32,
-    pub total_height: u32,
-    pub center_x: f64,
-    pub center_y: f64,
-    pub zoom: f64,
-    pub max_iterations: u32,
-}
+/// Reconnection delay
+const RECONNECT_DELAY_SECS: u64 = 5;
 
-#[derive(Debug, Deserialize)]
-pub struct BenchmarkRequest {
-    pub width: u32,
-    pub height: u32,
-}
-
-/// Response message to client
-#[derive(Debug, Serialize)]
-#[serde(tag = "type")]
-#[serde(rename_all = "snake_case")]
-pub enum ServerMessage {
-    Strip(StripResponse),
-    BenchmarkResult(BenchmarkResponse),
-    Error(ErrorResponse),
-}
-
-#[derive(Debug, Serialize)]
-pub struct StripResponse {
-    pub frame_id: u64,
-    pub y_start: u32,
-    pub y_end: u32,
-    pub compute_ms: u64,
-    pub data: String, // Base64 encoded RGB
-}
-
-#[derive(Debug, Serialize)]
-pub struct BenchmarkResponse {
-    pub compute_ms: u64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ErrorResponse {
-    pub message: String,
-}
-
-/// Shared state for workers
-pub struct WorkerState {
+/// Worker state
+pub struct Worker {
+    pub worker_id: String,
+    pub coordinator_url: String,
     pub palette: Vec<(u8, u8, u8)>,
 }
 
-impl WorkerState {
-    pub fn new() -> Self {
+impl Worker {
+    pub fn new(coordinator_url: String) -> Self {
         Self {
+            worker_id: uuid::Uuid::new_v4().to_string(),
+            coordinator_url,
             palette: generate_palette(2048),
         }
     }
-}
 
-impl Default for WorkerState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+    /// Run the worker - connects to coordinator and processes work
+    pub async fn run(self: Arc<Self>) {
+        loop {
+            tracing::info!("Connecting to coordinator at {}", self.coordinator_url);
 
-/// Handle a WebSocket connection
-pub async fn handle_socket(socket: WebSocket, state: Arc<WorkerState>) {
-    let (mut sender, mut receiver) = socket.split();
-
-    tracing::info!("New WebSocket connection established");
-
-    while let Some(msg) = receiver.next().await {
-        let msg = match msg {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::error!("WebSocket receive error: {}", e);
-                break;
-            }
-        };
-
-        // Handle text messages only
-        let text = match msg {
-            Message::Text(text) => text,
-            Message::Close(_) => {
-                tracing::info!("WebSocket closed by client");
-                break;
-            }
-            Message::Ping(data) => {
-                if let Err(e) = sender.send(Message::Pong(data)).await {
-                    tracing::error!("Failed to send pong: {}", e);
-                    break;
+            match self.connect_and_work().await {
+                Ok(_) => {
+                    tracing::info!("Disconnected from coordinator");
                 }
-                continue;
+                Err(e) => {
+                    tracing::error!("Connection error: {}", e);
+                }
             }
-            _ => continue,
-        };
 
-        // Parse the message
-        let client_msg: ClientMessage = match serde_json::from_str(&text) {
-            Ok(msg) => msg,
-            Err(e) => {
-                let error = ServerMessage::Error(ErrorResponse {
-                    message: format!("Invalid message format: {}", e),
-                });
-                let _ = sender
-                    .send(Message::Text(serde_json::to_string(&error).unwrap().into()))
-                    .await;
-                continue;
-            }
-        };
-
-        // Process the request
-        let response = match client_msg {
-            ClientMessage::Render(req) => process_render_request(req, &state),
-            ClientMessage::Benchmark(req) => process_benchmark_request(req, &state),
-        };
-
-        // Send response
-        let response_text = serde_json::to_string(&response).unwrap();
-        if let Err(e) = sender.send(Message::Text(response_text.into())).await {
-            tracing::error!("Failed to send response: {}", e);
-            break;
+            tracing::info!("Reconnecting in {} seconds...", RECONNECT_DELAY_SECS);
+            tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)).await;
         }
     }
 
-    tracing::info!("WebSocket connection closed");
-}
+    async fn connect_and_work(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (ws_stream, _) = connect_async(&self.coordinator_url).await?;
+        let (mut sender, mut receiver) = ws_stream.split();
 
-fn process_render_request(req: RenderRequest, state: &WorkerState) -> ServerMessage {
-    let start = Instant::now();
+        tracing::info!("Connected to coordinator");
 
-    // Validate request
-    if req.y_end <= req.y_start || req.width == 0 || req.total_height == 0 {
-        return ServerMessage::Error(ErrorResponse {
-            message: "Invalid strip dimensions".to_string(),
+        // Register with coordinator
+        let register_msg = WorkerToCoordinator::Register {
+            worker_id: self.worker_id.clone(),
+        };
+        sender.send(Message::Text(serde_json::to_string(&register_msg)?)).await?;
+
+        // Spawn heartbeat task
+        let worker_id = self.worker_id.clone();
+        let heartbeat_sender = sender.reunite(receiver).expect("reunite failed");
+        let (mut sender, mut receiver) = heartbeat_sender.split();
+
+        let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        let heartbeat_worker_id = worker_id.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // Heartbeat will be sent via main loop
+                    }
+                    _ = heartbeat_rx.recv() => {
+                        break;
+                    }
+                }
+            }
         });
+
+        // Spawn sender task
+        let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<WorkerToCoordinator>(32);
+
+        tokio::spawn(async move {
+            while let Some(msg) = send_rx.recv().await {
+                let text = serde_json::to_string(&msg).unwrap();
+                if sender.send(Message::Text(text)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Heartbeat loop
+        let heartbeat_tx_clone = send_tx.clone();
+        let heartbeat_worker_id = self.worker_id.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+            loop {
+                interval.tick().await;
+                let msg = WorkerToCoordinator::Heartbeat {
+                    worker_id: heartbeat_worker_id.clone(),
+                };
+                if heartbeat_tx_clone.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Process messages from coordinator
+        while let Some(msg) = receiver.next().await {
+            let msg = match msg {
+                Ok(Message::Text(text)) => text,
+                Ok(Message::Close(_)) => {
+                    tracing::info!("Coordinator closed connection");
+                    break;
+                }
+                Ok(Message::Ping(data)) => {
+                    // Pong is handled automatically by tungstenite
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!("WebSocket error: {}", e);
+                    break;
+                }
+                _ => continue,
+            };
+
+            let parsed: CoordinatorToWorker = match serde_json::from_str(&msg) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!("Invalid coordinator message: {}", e);
+                    continue;
+                }
+            };
+
+            match parsed {
+                CoordinatorToWorker::Registered { worker_id } => {
+                    tracing::info!("Successfully registered as {}", worker_id);
+                }
+
+                CoordinatorToWorker::RunProfile { width, height } => {
+                    tracing::debug!("Running profile {}x{}", width, height);
+                    let compute_ms = self.run_profile(width, height);
+                    let response = WorkerToCoordinator::ProfileResult {
+                        worker_id: self.worker_id.clone(),
+                        compute_ms,
+                    };
+                    let _ = send_tx.send(response).await;
+                }
+
+                CoordinatorToWorker::RenderStrip(req) => {
+                    tracing::debug!("Rendering strip {} y={}..{}", req.frame_id, req.y_start, req.y_end);
+                    let result = self.render_strip_request(&req);
+                    let _ = send_tx.send(WorkerToCoordinator::StripResult(result)).await;
+                }
+            }
+        }
+
+        // Signal heartbeat to stop
+        drop(heartbeat_tx);
+
+        Ok(())
     }
 
-    // Render the strip
-    let pixels = render_strip(
-        req.width,
-        req.y_start,
-        req.y_end,
-        req.total_height,
-        req.center_x,
-        req.center_y,
-        req.zoom,
-        req.max_iterations,
-        &state.palette,
-    );
+    /// Run a profiling computation
+    fn run_profile(&self, width: u32, height: u32) -> u64 {
+        let start = Instant::now();
 
-    let compute_ms = start.elapsed().as_millis() as u64;
+        // Fixed profile area - standard Mandelbrot view
+        let _ = render_strip(
+            width,
+            0,
+            height,
+            height,
+            -0.5,
+            0.0,
+            1.0,
+            256,
+            &self.palette,
+        );
 
-    // Encode as base64
-    let data = base64::engine::general_purpose::STANDARD.encode(&pixels);
+        start.elapsed().as_millis() as u64
+    }
 
-    ServerMessage::Strip(StripResponse {
-        frame_id: req.frame_id,
-        y_start: req.y_start,
-        y_end: req.y_end,
-        compute_ms,
-        data,
-    })
-}
+    /// Render a strip request
+    fn render_strip_request(&self, req: &RenderStripRequest) -> StripResult {
+        let start = Instant::now();
 
-fn process_benchmark_request(req: BenchmarkRequest, state: &WorkerState) -> ServerMessage {
-    let start = Instant::now();
+        let pixels = render_strip(
+            req.width,
+            req.y_start,
+            req.y_end,
+            req.total_height,
+            req.center_x,
+            req.center_y,
+            req.zoom,
+            req.max_iterations,
+            &self.palette,
+        );
 
-    // Render a small test region
-    let _ = render_strip(
-        req.width,
-        0,
-        req.height,
-        req.height,
-        -0.5, // Standard Mandelbrot view
-        0.0,
-        1.0,
-        256, // Fixed iterations for benchmark
-        &state.palette,
-    );
+        let compute_ms = start.elapsed().as_millis() as u64;
+        let data = base64::engine::general_purpose::STANDARD.encode(&pixels);
 
-    let compute_ms = start.elapsed().as_millis() as u64;
-
-    ServerMessage::BenchmarkResult(BenchmarkResponse { compute_ms })
+        StripResult {
+            worker_id: self.worker_id.clone(),
+            frame_id: req.frame_id,
+            y_start: req.y_start,
+            y_end: req.y_end,
+            compute_ms,
+            data,
+        }
+    }
 }

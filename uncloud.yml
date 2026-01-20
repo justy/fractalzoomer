@@ -1,11 +1,30 @@
 # Uncloud deployment configuration
 # Deploy with: uncloud deploy
+#
+# Architecture:
+# - coordinator: Single instance, serves web UI, manages workers
+# - worker: Multiple instances across cluster, connect to coordinator
 
 services:
-  fractalzoomer:
+  # Coordinator - serves the web UI and orchestrates workers
+  coordinator:
     image: ghcr.io/justy/fractalzoomer:latest
     x-ports:
       - fractalzoomer.justy.me:80/https
     environment:
+      - MODE=coordinator
       - RUST_LOG=info
-      - PORT=8080
+      - PORT=80
+
+  # Workers - run on each machine to do the actual computation
+  # Workers auto-discover coordinator via internal DNS
+  worker:
+    image: ghcr.io/justy/fractalzoomer:latest
+    x-machines:
+      - box1
+      - megaton
+      - gigaton
+    environment:
+      - MODE=worker
+      - COORDINATOR_URL=ws://coordinator:80/ws/worker
+      - RUST_LOG=info

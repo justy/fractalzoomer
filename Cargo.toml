@@ -14,6 +14,9 @@ base64 = "0.21"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
+tokio-tungstenite = "0.21"
+uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.12"
 
 [profile.release]
 opt-level = 3

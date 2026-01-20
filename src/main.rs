@@ -1,5 +1,7 @@
 mod colour;
+mod coordinator;
 mod mandelbrot;
+mod messages;
 mod worker;
 
 use axum::{
@@ -17,7 +19,14 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use worker::WorkerState;
+use coordinator::Coordinator;
+use worker::Worker;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Coordinator,
+    Worker,
+}
 
 #[tokio::main]
 async fn main() {
@@ -30,10 +39,35 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Create shared worker state
-    let state = Arc::new(WorkerState::new());
+    // Determine mode from environment
+    let mode = match std::env::var("MODE").as_deref() {
+        Ok("coordinator") => Mode::Coordinator,
+        Ok("worker") => Mode::Worker,
+        _ => {
+            // Default based on whether COORDINATOR_URL is set
+            if std::env::var("COORDINATOR_URL").is_ok() {
+                Mode::Worker
+            } else {
+                Mode::Coordinator
+            }
+        }
+    };
 
-    // CORS configuration for development
+    match mode {
+        Mode::Coordinator => run_coordinator().await,
+        Mode::Worker => run_worker().await,
+    }
+}
+
+async fn run_coordinator() {
+    tracing::info!("Starting in COORDINATOR mode");
+
+    let coordinator = Coordinator::new();
+
+    // Start the profiling loop
+    coordinator.start_profile_loop();
+
+    // CORS configuration
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -41,11 +75,12 @@ async fn main() {
 
     // Build the router
     let app = Router::new()
-        .route("/ws", get(ws_handler))
+        .route("/ws/worker", get(worker_ws_handler))
+        .route("/ws/client", get(client_ws_handler))
         .route("/health", get(health_handler))
         .nest_service("/", ServeDir::new("static").append_index_html_on_directories(true))
         .layer(cors)
-        .with_state(state);
+        .with_state(coordinator);
 
     // Get port from environment or default to 8080
     let port: u16 = std::env::var("PORT")
@@ -54,18 +89,40 @@ async fn main() {
         .unwrap_or(8080);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("Fractal Zoomer worker listening on {}", addr);
+    tracing::info!("Coordinator listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-/// WebSocket upgrade handler
-async fn ws_handler(
+async fn run_worker() {
+    let coordinator_url = std::env::var("COORDINATOR_URL")
+        .expect("COORDINATOR_URL environment variable required in worker mode");
+
+    tracing::info!("Starting in WORKER mode, coordinator: {}", coordinator_url);
+
+    let worker = Arc::new(Worker::new(coordinator_url));
+    worker.run().await;
+}
+
+/// WebSocket handler for worker connections (coordinator side)
+async fn worker_ws_handler(
     ws: WebSocketUpgrade,
-    State(state): State<Arc<WorkerState>>,
+    State(coordinator): State<Arc<Coordinator>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket: WebSocket| worker::handle_socket(socket, state))
+    ws.on_upgrade(move |socket: WebSocket| async move {
+        coordinator.handle_worker_connection(socket).await;
+    })
+}
+
+/// WebSocket handler for client connections (coordinator side)
+async fn client_ws_handler(
+    ws: WebSocketUpgrade,
+    State(coordinator): State<Arc<Coordinator>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket: WebSocket| async move {
+        coordinator.handle_client_connection(socket).await;
+    })
 }
 
 /// Health check endpoint

@@ -1,9 +1,8 @@
 /**
  * Fractal Zoomer Client
  *
- * Manages multiple WebSocket connections to worker servers,
- * distributes rendering work based on worker capability,
- * and assembles strips into complete frames.
+ * Connects to the coordinator and requests complete frames.
+ * The coordinator handles worker management and frame assembly.
  */
 
 class FractalZoomer {
@@ -16,7 +15,6 @@ class FractalZoomer {
         const params = new URLSearchParams(window.location.search);
         this.width = parseInt(params.get('w')) || 1280;
         this.height = parseInt(params.get('h')) || 720;
-        this.targetFps = parseInt(params.get('fps')) || 30;
 
         this.canvas.width = this.width;
         this.canvas.height = this.height;
@@ -28,29 +26,18 @@ class FractalZoomer {
         this.zoomSpeed = 1.02;
         this.maxIterations = 500;
 
-        // Worker management
-        this.workers = [];
-        this.workerCapabilities = new Map(); // worker index -> capability score
-        this.targetWorkerCount = 4;
-
-        // Frame management
-        this.frameId = 0;
-        this.pendingStrips = new Map(); // frame_id -> { strips: Map, expected: number }
+        // Connection state
+        this.socket = null;
+        this.connected = false;
         this.running = false;
+        this.pendingFrame = false;
 
-        // FPS tracking
+        // Stats
+        this.frameCount = 0;
         this.frameTimestamps = [];
         this.lastStatsUpdate = 0;
-
-        // Get worker URL(s) from params or use current host
-        const workerUrls = params.get('workers');
-        if (workerUrls) {
-            this.workerBaseUrls = workerUrls.split(',');
-        } else {
-            // Default: connect to same host
-            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            this.workerBaseUrls = [`${wsProtocol}//${window.location.host}/ws`];
-        }
+        this.lastRenderMs = 0;
+        this.workerCount = 0;
 
         // UI elements
         this.fpsDisplay = document.getElementById('fps');
@@ -59,7 +46,6 @@ class FractalZoomer {
         this.frameDisplay = document.getElementById('frame');
         this.startBtn = document.getElementById('startBtn');
         this.stopBtn = document.getElementById('stopBtn');
-        this.workerCountInput = document.getElementById('workerCount');
         this.maxIterInput = document.getElementById('maxIter');
         this.zoomSpeedInput = document.getElementById('zoomSpeed');
 
@@ -69,10 +55,6 @@ class FractalZoomer {
     setupEventListeners() {
         this.startBtn.addEventListener('click', () => this.start());
         this.stopBtn.addEventListener('click', () => this.stop());
-
-        this.workerCountInput.addEventListener('change', (e) => {
-            this.targetWorkerCount = parseInt(e.target.value) || 4;
-        });
 
         this.maxIterInput.addEventListener('change', (e) => {
             this.maxIterations = parseInt(e.target.value) || 500;
@@ -89,12 +71,11 @@ class FractalZoomer {
         this.stopBtn.disabled = false;
 
         // Read current values from inputs
-        this.targetWorkerCount = parseInt(this.workerCountInput.value) || 4;
         this.maxIterations = parseInt(this.maxIterInput.value) || 500;
         this.zoomSpeed = parseFloat(this.zoomSpeedInput.value) || 1.02;
 
-        // Connect to workers
-        await this.connectWorkers();
+        // Connect to coordinator
+        await this.connect();
 
         // Start rendering loop
         this.renderLoop();
@@ -105,61 +86,45 @@ class FractalZoomer {
         this.startBtn.disabled = false;
         this.stopBtn.disabled = true;
 
-        // Close all WebSocket connections
-        for (const worker of this.workers) {
-            if (worker.socket.readyState === WebSocket.OPEN) {
-                worker.socket.close();
-            }
+        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.close();
         }
-        this.workers = [];
-        this.workerCapabilities.clear();
+        this.socket = null;
+        this.connected = false;
     }
 
-    async connectWorkers() {
-        const connectPromises = [];
-
-        for (let i = 0; i < this.targetWorkerCount; i++) {
-            // Round-robin through available URLs
-            const url = this.workerBaseUrls[i % this.workerBaseUrls.length];
-            connectPromises.push(this.connectWorker(i, url));
-        }
-
-        await Promise.all(connectPromises);
-
-        // Benchmark all workers
-        await this.benchmarkWorkers();
-    }
-
-    connectWorker(index, url) {
+    connect() {
         return new Promise((resolve, reject) => {
-            const socket = new WebSocket(url);
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const url = `${wsProtocol}//${window.location.host}/ws/client`;
 
-            socket.onopen = () => {
-                console.log(`Worker ${index} connected to ${url}`);
-                this.workers[index] = {
-                    socket,
-                    url,
-                    busy: false,
-                    capability: 1.0
-                };
+            console.log('Connecting to coordinator:', url);
+            this.socket = new WebSocket(url);
+
+            this.socket.onopen = () => {
+                console.log('Connected to coordinator');
+                this.connected = true;
+                // Request initial status
+                this.requestStatus();
                 resolve();
             };
 
-            socket.onmessage = (event) => {
-                this.handleWorkerMessage(index, JSON.parse(event.data));
+            this.socket.onmessage = (event) => {
+                this.handleMessage(JSON.parse(event.data));
             };
 
-            socket.onerror = (error) => {
-                console.error(`Worker ${index} error:`, error);
+            this.socket.onerror = (error) => {
+                console.error('WebSocket error:', error);
             };
 
-            socket.onclose = () => {
-                console.log(`Worker ${index} disconnected`);
+            this.socket.onclose = () => {
+                console.log('Disconnected from coordinator');
+                this.connected = false;
                 if (this.running) {
-                    // Attempt reconnection after delay
+                    // Attempt reconnection
                     setTimeout(() => {
                         if (this.running) {
-                            this.connectWorker(index, url);
+                            this.connect();
                         }
                     }, 1000);
                 }
@@ -167,165 +132,77 @@ class FractalZoomer {
 
             // Timeout for connection
             setTimeout(() => {
-                if (socket.readyState !== WebSocket.OPEN) {
-                    socket.close();
-                    reject(new Error(`Worker ${index} connection timeout`));
+                if (!this.connected) {
+                    this.socket.close();
+                    reject(new Error('Connection timeout'));
                 }
             }, 5000);
         });
     }
 
-    async benchmarkWorkers() {
-        const benchmarkPromises = [];
-
-        for (let i = 0; i < this.workers.length; i++) {
-            if (this.workers[i] && this.workers[i].socket.readyState === WebSocket.OPEN) {
-                benchmarkPromises.push(this.benchmarkWorker(i));
-            }
-        }
-
-        await Promise.all(benchmarkPromises);
-
-        // Normalise capabilities
-        this.normaliseCapabilities();
-    }
-
-    benchmarkWorker(index) {
-        return new Promise((resolve) => {
-            const worker = this.workers[index];
-
-            // Store callback for benchmark result
-            worker.benchmarkResolve = resolve;
-
-            // Send benchmark request
-            worker.socket.send(JSON.stringify({
-                type: 'benchmark',
-                width: 256,
-                height: 256
-            }));
-
-            // Timeout
-            setTimeout(() => {
-                if (worker.benchmarkResolve) {
-                    worker.capability = 0.1; // Low score for timeout
-                    worker.benchmarkResolve();
-                    delete worker.benchmarkResolve;
-                }
-            }, 10000);
-        });
-    }
-
-    normaliseCapabilities() {
-        // Convert times to capabilities (inverse of time)
-        // Higher capability = more pixels per second
-        let totalCapability = 0;
-
-        for (let i = 0; i < this.workers.length; i++) {
-            if (this.workers[i]) {
-                totalCapability += this.workers[i].capability;
-            }
-        }
-
-        // Normalise so they sum to 1
-        for (let i = 0; i < this.workers.length; i++) {
-            if (this.workers[i]) {
-                this.workers[i].capability /= totalCapability;
-            }
-        }
-
-        console.log('Worker capabilities:', this.workers.map((w, i) =>
-            w ? `${i}: ${(w.capability * 100).toFixed(1)}%` : null
-        ).filter(Boolean));
-    }
-
-    handleWorkerMessage(workerIndex, message) {
-        const worker = this.workers[workerIndex];
-        if (!worker) return;
-
+    handleMessage(message) {
         switch (message.type) {
-            case 'benchmark_result':
-                // Convert compute time to capability score (inverse)
-                worker.capability = 1000 / (message.compute_ms || 1);
-                if (worker.benchmarkResolve) {
-                    worker.benchmarkResolve();
-                    delete worker.benchmarkResolve;
-                }
+            case 'frame':
+                this.handleFrame(message);
                 break;
-
-            case 'strip':
-                this.handleStripResult(workerIndex, message);
+            case 'status':
+                this.handleStatus(message);
                 break;
-
             case 'error':
-                console.error(`Worker ${workerIndex} error:`, message.message);
-                worker.busy = false;
+                console.error('Coordinator error:', message.message);
+                this.pendingFrame = false;
                 break;
         }
     }
 
-    handleStripResult(workerIndex, message) {
-        const worker = this.workers[workerIndex];
-        if (worker) {
-            worker.busy = false;
+    handleFrame(frame) {
+        this.pendingFrame = false;
+        this.lastRenderMs = frame.render_ms;
+
+        // Decode base64 RGB data
+        const binaryString = atob(frame.data);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
         }
 
-        const frameData = this.pendingStrips.get(message.frame_id);
-        if (!frameData) {
-            // Frame already completed or discarded
-            return;
-        }
-
-        // Store the strip
-        frameData.strips.set(message.y_start, {
-            yStart: message.y_start,
-            yEnd: message.y_end,
-            data: message.data
-        });
-
-        // Check if frame is complete
-        if (frameData.strips.size === frameData.expected) {
-            this.assembleFrame(message.frame_id, frameData);
-            this.pendingStrips.delete(message.frame_id);
-        }
-    }
-
-    assembleFrame(frameId, frameData) {
-        // Sort strips by y position
-        const sortedStrips = Array.from(frameData.strips.values())
-            .sort((a, b) => a.yStart - b.yStart);
-
-        // Create ImageData for the full frame
-        const imageData = this.ctx.createImageData(this.width, this.height);
-
-        for (const strip of sortedStrips) {
-            // Decode base64 RGB data
-            const binaryString = atob(strip.data);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-                bytes[i] = binaryString.charCodeAt(i);
-            }
-
-            // Copy RGB to RGBA ImageData
-            const stripHeight = strip.yEnd - strip.yStart;
-            for (let y = 0; y < stripHeight; y++) {
-                for (let x = 0; x < this.width; x++) {
-                    const srcIdx = (y * this.width + x) * 3;
-                    const dstIdx = ((strip.yStart + y) * this.width + x) * 4;
-
-                    imageData.data[dstIdx] = bytes[srcIdx];         // R
-                    imageData.data[dstIdx + 1] = bytes[srcIdx + 1]; // G
-                    imageData.data[dstIdx + 2] = bytes[srcIdx + 2]; // B
-                    imageData.data[dstIdx + 3] = 255;               // A
-                }
-            }
+        // Create ImageData and copy RGB to RGBA
+        const imageData = this.ctx.createImageData(frame.width, frame.height);
+        for (let i = 0, j = 0; i < bytes.length; i += 3, j += 4) {
+            imageData.data[j] = bytes[i];         // R
+            imageData.data[j + 1] = bytes[i + 1]; // G
+            imageData.data[j + 2] = bytes[i + 2]; // B
+            imageData.data[j + 3] = 255;          // A
         }
 
         // Draw to canvas
         this.ctx.putImageData(imageData, 0, 0);
 
-        // Update FPS
+        // Update stats
+        this.frameCount++;
         this.frameTimestamps.push(performance.now());
         this.updateStats();
+
+        // Increase zoom for next frame
+        this.zoom *= this.zoomSpeed;
+    }
+
+    handleStatus(status) {
+        this.workerCount = status.workers.length;
+        this.updateStats();
+
+        // Log worker capabilities
+        if (status.workers.length > 0) {
+            console.log('Workers:', status.workers.map(w =>
+                `${w.worker_id.substring(0, 8)}: ${w.capability.toFixed(2)}`
+            ).join(', '));
+        }
+    }
+
+    requestStatus() {
+        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.send(JSON.stringify({ type: 'get_status' }));
+        }
     }
 
     updateStats() {
@@ -340,16 +217,11 @@ class FractalZoomer {
         this.frameTimestamps = this.frameTimestamps.filter(t => t > cutoff);
         const fps = this.frameTimestamps.length;
 
-        // Count connected workers
-        const connectedWorkers = this.workers.filter(w =>
-            w && w.socket.readyState === WebSocket.OPEN
-        ).length;
-
         // Update displays
-        this.fpsDisplay.textContent = `FPS: ${fps}`;
+        this.fpsDisplay.textContent = `FPS: ${fps} (${this.lastRenderMs}ms)`;
         this.zoomDisplay.textContent = `Zoom: ${this.formatZoom(this.zoom)}`;
-        this.workersDisplay.textContent = `Workers: ${connectedWorkers}/${this.targetWorkerCount}`;
-        this.frameDisplay.textContent = `Frame: ${this.frameId}`;
+        this.workersDisplay.textContent = `Workers: ${this.workerCount}`;
+        this.frameDisplay.textContent = `Frame: ${this.frameCount}`;
     }
 
     formatZoom(zoom) {
@@ -363,9 +235,8 @@ class FractalZoomer {
     renderLoop() {
         if (!this.running) return;
 
-        // Check if we can start a new frame
-        // Only allow 2 frames in flight to avoid memory buildup
-        if (this.pendingStrips.size < 2) {
+        // Request next frame if not already pending
+        if (!this.pendingFrame && this.connected) {
             this.requestFrame();
         }
 
@@ -374,22 +245,11 @@ class FractalZoomer {
     }
 
     requestFrame() {
-        const availableWorkers = this.workers.filter(w =>
-            w && !w.busy && w.socket.readyState === WebSocket.OPEN
-        );
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+            return;
+        }
 
-        if (availableWorkers.length === 0) return;
-
-        const frameId = this.frameId++;
-
-        // Calculate strip assignments based on capability
-        const assignments = this.calculateStripAssignments(availableWorkers);
-
-        // Create frame tracking
-        this.pendingStrips.set(frameId, {
-            strips: new Map(),
-            expected: assignments.length
-        });
+        this.pendingFrame = true;
 
         // Scale max iterations with zoom level
         const scaledIterations = Math.min(
@@ -397,66 +257,22 @@ class FractalZoomer {
             5000
         );
 
-        // Send requests to workers
-        for (const assignment of assignments) {
-            const worker = assignment.worker;
-            worker.busy = true;
+        const request = {
+            type: 'request_frame',
+            width: this.width,
+            height: this.height,
+            center_x: this.centerX,
+            center_y: this.centerY,
+            zoom: this.zoom,
+            max_iterations: scaledIterations
+        };
 
-            worker.socket.send(JSON.stringify({
-                type: 'render',
-                frame_id: frameId,
-                width: this.width,
-                y_start: assignment.yStart,
-                y_end: assignment.yEnd,
-                total_height: this.height,
-                center_x: this.centerX,
-                center_y: this.centerY,
-                zoom: this.zoom,
-                max_iterations: scaledIterations
-            }));
+        this.socket.send(JSON.stringify(request));
+
+        // Periodically request status
+        if (this.frameCount % 60 === 0) {
+            this.requestStatus();
         }
-
-        // Increase zoom for next frame
-        this.zoom *= this.zoomSpeed;
-    }
-
-    calculateStripAssignments(workers) {
-        const assignments = [];
-        let currentY = 0;
-
-        // Calculate total capability
-        const totalCapability = workers.reduce((sum, w) => sum + w.capability, 0);
-
-        for (let i = 0; i < workers.length; i++) {
-            const worker = workers[i];
-            const proportion = worker.capability / totalCapability;
-
-            // Calculate strip height based on capability proportion
-            let stripHeight;
-            if (i === workers.length - 1) {
-                // Last worker gets the remainder
-                stripHeight = this.height - currentY;
-            } else {
-                stripHeight = Math.round(this.height * proportion);
-            }
-
-            // Ensure at least 1 pixel
-            stripHeight = Math.max(1, stripHeight);
-
-            // Don't exceed remaining height
-            stripHeight = Math.min(stripHeight, this.height - currentY);
-
-            if (stripHeight > 0) {
-                assignments.push({
-                    worker,
-                    yStart: currentY,
-                    yEnd: currentY + stripHeight
-                });
-                currentY += stripHeight;
-            }
-        }
-
-        return assignments;
     }
 }
 
