@@ -2,10 +2,9 @@
 
 use axum::extract::ws::{Message, WebSocket};
 use base64::Engine;
-use futures_util::{SinkExt, StreamExt, stream::SplitSink};
-use parking_lot::RwLock;
+use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
@@ -73,13 +72,13 @@ impl Coordinator {
     /// Run profiling on all workers
     async fn run_profiling(&self) {
         let worker_ids: Vec<String> = {
-            self.workers.read().keys().cloned().collect()
+            self.workers.read().unwrap().keys().cloned().collect()
         };
 
         tracing::info!("Running profiling on {} workers", worker_ids.len());
 
         for worker_id in worker_ids {
-            if let Some(worker) = self.workers.read().get(&worker_id) {
+            if let Some(worker) = self.workers.read().unwrap().get(&worker_id) {
                 let msg = CoordinatorToWorker::RunProfile {
                     width: PROFILE_WIDTH,
                     height: PROFILE_HEIGHT,
@@ -92,7 +91,7 @@ impl Coordinator {
     /// Remove workers that haven't sent a heartbeat recently
     fn cleanup_stale_workers(&self) {
         let timeout = Duration::from_secs(WORKER_TIMEOUT_SECS);
-        let mut workers = self.workers.write();
+        let mut workers = self.workers.write().unwrap();
         let before = workers.len();
         workers.retain(|id, info| {
             let alive = info.last_seen.elapsed() < timeout;
@@ -156,7 +155,7 @@ impl Coordinator {
 
                     // Add worker to pool
                     {
-                        let mut workers = coordinator.workers.write();
+                        let mut workers = coordinator.workers.write().unwrap();
                         workers.insert(id.clone(), WorkerInfo {
                             sender: tx.clone(),
                             capability: 1.0,  // Default until profiled
@@ -176,14 +175,14 @@ impl Coordinator {
                 }
 
                 WorkerToCoordinator::Heartbeat { worker_id: id } => {
-                    if let Some(worker) = coordinator.workers.write().get_mut(&id) {
+                    if let Some(worker) = coordinator.workers.write().unwrap().get_mut(&id) {
                         worker.last_seen = Instant::now();
                     }
                 }
 
                 WorkerToCoordinator::ProfileResult { worker_id: id, compute_ms } => {
                     tracing::info!("Worker {} profile: {}ms", id, compute_ms);
-                    if let Some(worker) = coordinator.workers.write().get_mut(&id) {
+                    if let Some(worker) = coordinator.workers.write().unwrap().get_mut(&id) {
                         // Capability is inverse of time (higher = faster)
                         worker.capability = 1000.0 / (compute_ms.max(1) as f64);
                         worker.last_seen = Instant::now();
@@ -199,14 +198,14 @@ impl Coordinator {
         // Worker disconnected - remove from pool
         if let Some(id) = worker_id {
             tracing::info!("Worker disconnected: {}", id);
-            coordinator.workers.write().remove(&id);
+            coordinator.workers.write().unwrap().remove(&id);
         }
     }
 
     /// Handle a completed strip from a worker
     async fn handle_strip_result(&self, result: StripResult) {
         // Mark worker as not busy
-        if let Some(worker) = self.workers.write().get_mut(&result.worker_id) {
+        if let Some(worker) = self.workers.write().unwrap().get_mut(&result.worker_id) {
             worker.busy = false;
             worker.last_seen = Instant::now();
         }
@@ -221,7 +220,7 @@ impl Coordinator {
         };
 
         // Add to pending frame
-        let mut pending = self.pending_frames.write();
+        let mut pending = self.pending_frames.write().unwrap();
         if let Some(frame) = pending.get_mut(&result.frame_id) {
             frame.strips.insert(result.y_start, pixel_data);
 
@@ -242,7 +241,7 @@ impl Coordinator {
                 // Send response (take ownership of response_tx)
                 if let Some(frame) = pending.remove(&result.frame_id) {
                     let _ = frame.response_tx.send(response);
-                    *self.frames_rendered.write() += 1;
+                    *self.frames_rendered.write().unwrap() += 1;
                 }
             }
         }
@@ -270,7 +269,7 @@ impl Coordinator {
     /// Handle a client frame request
     pub async fn request_frame(&self, request: FrameRequest) -> Result<FrameResponse, String> {
         let frame_id = {
-            let mut id = self.next_frame_id.write();
+            let mut id = self.next_frame_id.write().unwrap();
             let current = *id;
             *id += 1;
             current
@@ -278,7 +277,7 @@ impl Coordinator {
 
         // Get available workers and their capabilities
         let workers: Vec<(String, f64, mpsc::Sender<CoordinatorToWorker>)> = {
-            let workers = self.workers.read();
+            let workers = self.workers.read().unwrap();
             workers.iter()
                 .filter(|(_, info)| !info.busy)
                 .map(|(id, info)| (id.clone(), info.capability, info.sender.clone()))
@@ -324,7 +323,7 @@ impl Coordinator {
         // Create pending frame
         let (response_tx, response_rx) = oneshot::channel();
         {
-            let mut pending = self.pending_frames.write();
+            let mut pending = self.pending_frames.write().unwrap();
             pending.insert(frame_id, PendingFrame {
                 width: request.width,
                 height: request.height,
@@ -337,7 +336,7 @@ impl Coordinator {
 
         // Mark workers as busy and send requests
         {
-            let mut workers = self.workers.write();
+            let mut workers = self.workers.write().unwrap();
             for (worker_id, _, _, _) in &strip_assignments {
                 if let Some(worker) = workers.get_mut(worker_id) {
                     worker.busy = true;
@@ -370,7 +369,7 @@ impl Coordinator {
             Ok(Err(_)) => Err("Frame assembly cancelled".to_string()),
             Err(_) => {
                 // Timeout - clean up pending frame
-                self.pending_frames.write().remove(&frame_id);
+                self.pending_frames.write().unwrap().remove(&frame_id);
                 Err("Frame render timeout".to_string())
             }
         }
@@ -378,7 +377,7 @@ impl Coordinator {
 
     /// Get current status
     pub fn get_status(&self) -> StatusResponse {
-        let workers = self.workers.read();
+        let workers = self.workers.read().unwrap();
         let worker_statuses: Vec<WorkerStatus> = workers.iter()
             .map(|(id, info)| WorkerStatus {
                 worker_id: id.clone(),
@@ -389,7 +388,7 @@ impl Coordinator {
 
         StatusResponse {
             workers: worker_statuses,
-            frames_rendered: *self.frames_rendered.read(),
+            frames_rendered: *self.frames_rendered.read().unwrap(),
         }
     }
 
