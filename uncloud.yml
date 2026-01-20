@@ -10,21 +10,49 @@ services:
   coordinator:
     image: ghcr.io/justy/fractalzoomer:latest
     x-ports:
-      - fractalzoomer.justy.me:80/https
+      - fractalzoomer.justy.me:8080/https
     environment:
       - MODE=coordinator
       - RUST_LOG=info
-      - PORT=80
+      - PORT=8080
 
-  # Workers - run on each machine to do the actual computation
-  # Workers auto-discover coordinator via internal DNS
-  worker:
+  # Workers - one per machine, connect to coordinator
+  worker-box1:
     image: ghcr.io/justy/fractalzoomer:latest
-    x-machines:
-      - box1
-      - megaton
-      - gigaton
+    deploy:
+      x-machines:
+        - box1
     environment:
       - MODE=worker
-      - COORDINATOR_URL=ws://coordinator:80/ws/worker
+      - COORDINATOR_URL=ws://coordinator:8080/ws/worker
+      - RUST_LOG=info
+
+  worker-megaton:
+    image: ghcr.io/justy/fractalzoomer:latest
+    deploy:
+      x-machines:
+        - megaton
+    environment:
+      - MODE=worker
+      - COORDINATOR_URL=ws://coordinator:8080/ws/worker
+      - RUST_LOG=info
+
+  worker-gigaton:
+    image: ghcr.io/justy/fractalzoomer:latest
+    deploy:
+      x-machines:
+        - gigaton
+    environment:
+      - MODE=worker
+      - COORDINATOR_URL=ws://coordinator:8080/ws/worker
+      - RUST_LOG=info
+
+  worker-m1:
+    image: ghcr.io/justy/fractalzoomer:latest
+    deploy:
+      x-machines:
+        - m1
+    environment:
+      - MODE=worker
+      - COORDINATOR_URL=ws://coordinator:8080/ws/worker
       - RUST_LOG=info
