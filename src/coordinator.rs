@@ -71,20 +71,20 @@ impl Coordinator {
 
     /// Run profiling on all workers
     async fn run_profiling(&self) {
-        let worker_ids: Vec<String> = {
-            self.workers.read().unwrap().keys().cloned().collect()
+        // Collect senders while holding lock, then release before awaiting
+        let senders: Vec<mpsc::Sender<CoordinatorToWorker>> = {
+            let workers = self.workers.read().unwrap();
+            tracing::info!("Running profiling on {} workers", workers.len());
+            workers.values().map(|w| w.sender.clone()).collect()
         };
 
-        tracing::info!("Running profiling on {} workers", worker_ids.len());
+        let msg = CoordinatorToWorker::RunProfile {
+            width: PROFILE_WIDTH,
+            height: PROFILE_HEIGHT,
+        };
 
-        for worker_id in worker_ids {
-            if let Some(worker) = self.workers.read().unwrap().get(&worker_id) {
-                let msg = CoordinatorToWorker::RunProfile {
-                    width: PROFILE_WIDTH,
-                    height: PROFILE_HEIGHT,
-                };
-                let _ = worker.sender.send(msg).await;
-            }
+        for sender in senders {
+            let _ = sender.send(msg.clone()).await;
         }
     }
 
