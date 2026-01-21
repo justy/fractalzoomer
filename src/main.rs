@@ -26,6 +26,7 @@ use worker::Worker;
 enum Mode {
     Coordinator,
     Worker,
+    Standalone,
 }
 
 #[tokio::main]
@@ -43,12 +44,14 @@ async fn main() {
     let mode = match std::env::var("MODE").as_deref() {
         Ok("coordinator") => Mode::Coordinator,
         Ok("worker") => Mode::Worker,
+        Ok("standalone") => Mode::Standalone,
         _ => {
             // Default based on whether COORDINATOR_URL is set
             if std::env::var("COORDINATOR_URL").is_ok() {
                 Mode::Worker
             } else {
-                Mode::Coordinator
+                // Default to standalone for ease of use
+                Mode::Standalone
             }
         }
     };
@@ -56,6 +59,7 @@ async fn main() {
     match mode {
         Mode::Coordinator => run_coordinator().await,
         Mode::Worker => run_worker().await,
+        Mode::Standalone => run_standalone().await,
     }
 }
 
@@ -103,6 +107,51 @@ async fn run_worker() {
 
     let worker = Arc::new(Worker::new(coordinator_url));
     worker.run().await;
+}
+
+async fn run_standalone() {
+    tracing::info!("Starting in STANDALONE mode (coordinator + local worker)");
+
+    let coordinator = Coordinator::new();
+
+    // Start the profiling loop
+    coordinator.start_profile_loop();
+
+    // Get port from environment or default to 8080
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8080);
+
+    // Spawn a local worker that connects to this coordinator
+    let worker_url = format!("ws://127.0.0.1:{}/ws/worker", port);
+    let worker = Arc::new(Worker::new(worker_url));
+    tokio::spawn(async move {
+        // Small delay to let the server start
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        worker.run().await;
+    });
+
+    // CORS configuration
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    // Build the router
+    let app = Router::new()
+        .route("/ws/worker", get(worker_ws_handler))
+        .route("/ws/client", get(client_ws_handler))
+        .route("/health", get(health_handler))
+        .nest_service("/", ServeDir::new("static").append_index_html_on_directories(true))
+        .layer(cors)
+        .with_state(coordinator);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    tracing::info!("Standalone server listening on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
 
 /// WebSocket handler for worker connections (coordinator side)
