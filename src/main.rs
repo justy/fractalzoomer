@@ -110,7 +110,17 @@ async fn run_worker() {
 }
 
 async fn run_standalone() {
-    tracing::info!("Starting in STANDALONE mode (coordinator + local worker)");
+    // Determine number of workers from env or CPU count
+    let num_workers: usize = std::env::var("WORKERS")
+        .ok()
+        .and_then(|w| w.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4)
+        });
+
+    tracing::info!("Starting in STANDALONE mode (coordinator + {} local workers)", num_workers);
 
     let coordinator = Coordinator::new();
 
@@ -123,14 +133,17 @@ async fn run_standalone() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);
 
-    // Spawn a local worker that connects to this coordinator
+    // Spawn local workers that connect to this coordinator
     let worker_url = format!("ws://127.0.0.1:{}/ws/worker", port);
-    let worker = Arc::new(Worker::new(worker_url));
-    tokio::spawn(async move {
-        // Small delay to let the server start
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        worker.run().await;
-    });
+    for i in 0..num_workers {
+        let url = worker_url.clone();
+        tokio::spawn(async move {
+            // Stagger worker startup slightly
+            tokio::time::sleep(std::time::Duration::from_millis(500 + (i as u64 * 100))).await;
+            let worker = Arc::new(Worker::new(url));
+            worker.run().await;
+        });
+    }
 
     // CORS configuration
     let cors = CorsLayer::new()

@@ -91,6 +91,7 @@ class FractalZoomer {
         }
         this.socket = null;
         this.connected = false;
+        this.pendingFrame = false;  // Reset so next start can request frames
     }
 
     connect() {
