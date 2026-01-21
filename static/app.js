@@ -25,6 +25,8 @@ class FractalZoomer {
         this.zoom = 1.0;
         this.zoomSpeed = 1.02;
         this.maxIterations = 500;
+        this.palette = 'fire';
+        this.colourInterior = false;
 
         // Connection state
         this.socket = null;
@@ -48,6 +50,8 @@ class FractalZoomer {
         this.stopBtn = document.getElementById('stopBtn');
         this.maxIterInput = document.getElementById('maxIter');
         this.zoomSpeedInput = document.getElementById('zoomSpeed');
+        this.paletteSelect = document.getElementById('palette');
+        this.colourInteriorCheckbox = document.getElementById('colourInterior');
 
         this.setupEventListeners();
     }
@@ -63,6 +67,14 @@ class FractalZoomer {
         this.zoomSpeedInput.addEventListener('change', (e) => {
             this.zoomSpeed = parseFloat(e.target.value) || 1.02;
         });
+
+        this.paletteSelect.addEventListener('change', (e) => {
+            this.palette = e.target.value;
+        });
+
+        this.colourInteriorCheckbox.addEventListener('change', (e) => {
+            this.colourInterior = e.target.checked;
+        });
     }
 
     async start() {
@@ -73,6 +85,8 @@ class FractalZoomer {
         // Read current values from inputs
         this.maxIterations = parseInt(this.maxIterInput.value) || 500;
         this.zoomSpeed = parseFloat(this.zoomSpeedInput.value) || 1.02;
+        this.palette = this.paletteSelect.value;
+        this.colourInterior = this.colourInteriorCheckbox.checked;
 
         // Connect to coordinator
         await this.connect();
@@ -265,7 +279,9 @@ class FractalZoomer {
             center_x: this.centerX,
             center_y: this.centerY,
             zoom: this.zoom,
-            max_iterations: scaledIterations
+            max_iterations: scaledIterations,
+            palette: this.palette,
+            colour_interior: this.colourInterior
         };
 
         this.socket.send(JSON.stringify(request));

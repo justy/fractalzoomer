@@ -356,6 +356,8 @@ impl Coordinator {
                 center_y: request.center_y,
                 zoom: request.zoom,
                 max_iterations: request.max_iterations,
+                palette: request.palette,
+                colour_interior: request.colour_interior,
             });
 
             if let Err(e) = sender.send(msg).await {

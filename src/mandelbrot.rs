@@ -2,10 +2,24 @@
 ///
 /// Uses escape-time algorithm with smooth colouring
 
+use crate::colour::colour_interior;
+
+/// Result of computing a single Mandelbrot point
+pub struct MandelbrotResult {
+    /// Smooth iteration count (>= max_iterations means in set)
+    pub smooth_iter: f64,
+    /// Final x position of orbit (for interior colouring)
+    pub final_x: f64,
+    /// Final y position of orbit (for interior colouring)
+    pub final_y: f64,
+    /// Whether the point is in the set
+    pub in_set: bool,
+}
+
 /// Compute the Mandelbrot iteration count for a single point
-/// Returns a smooth iteration count using the normalised iteration algorithm
+/// Returns smooth iteration count and final orbit position
 #[inline]
-pub fn mandelbrot_point(cx: f64, cy: f64, max_iterations: u32) -> f64 {
+pub fn mandelbrot_point(cx: f64, cy: f64, max_iterations: u32) -> MandelbrotResult {
     let mut x = 0.0_f64;
     let mut y = 0.0_f64;
     let mut x2 = 0.0_f64;
@@ -26,15 +40,24 @@ pub fn mandelbrot_point(cx: f64, cy: f64, max_iterations: u32) -> f64 {
 
     if iteration >= max_iterations {
         // Point is in the set
-        return max_iterations as f64;
+        return MandelbrotResult {
+            smooth_iter: max_iterations as f64,
+            final_x: x,
+            final_y: y,
+            in_set: true,
+        };
     }
 
     // Smooth colouring using normalised iteration count
-    // This gives fractional iteration values for smooth gradients
     let log_zn = (x2 + y2).ln() / 2.0;
     let nu = (log_zn / std::f64::consts::LN_2).ln() / std::f64::consts::LN_2;
 
-    iteration as f64 + 1.0 - nu
+    MandelbrotResult {
+        smooth_iter: iteration as f64 + 1.0 - nu,
+        final_x: x,
+        final_y: y,
+        in_set: false,
+    }
 }
 
 /// Render a horizontal strip of the Mandelbrot set
@@ -50,6 +73,7 @@ pub fn render_strip(
     zoom: f64,
     max_iterations: u32,
     palette: &[(u8, u8, u8)],
+    colour_interior_enabled: bool,
 ) -> Vec<u8> {
     let height = y_end - y_start;
     let mut pixels = Vec::with_capacity((width * height * 3) as usize);
@@ -71,14 +95,16 @@ pub fn render_strip(
             let cx = x_min + px as f64 * x_scale;
             let cy = y_min + py as f64 * y_scale;
 
-            let smooth_iter = mandelbrot_point(cx, cy, max_iterations);
+            let result = mandelbrot_point(cx, cy, max_iterations);
 
-            let (r, g, b) = if smooth_iter >= max_iterations as f64 {
-                // Inside the set - black
-                (0, 0, 0)
+            let (r, g, b) = if result.in_set {
+                if colour_interior_enabled {
+                    colour_interior(result.final_x, result.final_y, palette)
+                } else {
+                    (0, 0, 0)
+                }
             } else {
-                // Use smooth iteration for colour lookup
-                smooth_colour(smooth_iter, palette)
+                smooth_colour(result.smooth_iter, palette)
             };
 
             pixels.push(r);
@@ -120,19 +146,20 @@ fn lerp(a: u8, b: u8, t: f64) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::colour::generate_palette;
 
     #[test]
     fn test_mandelbrot_in_set() {
         // Origin is in the Mandelbrot set
         let result = mandelbrot_point(0.0, 0.0, 100);
-        assert_eq!(result, 100.0);
+        assert!(result.in_set);
+        assert_eq!(result.smooth_iter, 100.0);
     }
 
     #[test]
     fn test_mandelbrot_escapes() {
         // Point well outside the set
         let result = mandelbrot_point(2.0, 2.0, 100);
-        assert!(result < 10.0);
+        assert!(!result.in_set);
+        assert!(result.smooth_iter < 10.0);
     }
 }

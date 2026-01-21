@@ -184,6 +184,7 @@ impl Worker {
             1.0,
             256,
             &self.palette,
+            false,
         );
 
         start.elapsed().as_millis() as u64
@@ -192,6 +193,9 @@ impl Worker {
     /// Render a strip request
     fn render_strip_request(&self, req: &RenderStripRequest) -> StripResult {
         let start = Instant::now();
+
+        // Generate palette based on request
+        let palette = req.palette.generate(2048);
 
         let pixels = render_strip(
             req.width,
@@ -202,7 +206,8 @@ impl Worker {
             req.center_y,
             req.zoom,
             req.max_iterations,
-            &self.palette,
+            &palette,
+            req.colour_interior,
         );
 
         let compute_ms = start.elapsed().as_millis() as u64;

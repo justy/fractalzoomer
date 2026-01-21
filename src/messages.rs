@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::colour::Palette;
+
 // ============================================================================
 // Worker <-> Coordinator messages
 // ============================================================================
@@ -55,6 +57,10 @@ pub struct RenderStripRequest {
     pub center_y: f64,
     pub zoom: f64,
     pub max_iterations: u32,
+    #[serde(default)]
+    pub palette: Palette,
+    #[serde(default)]
+    pub colour_interior: bool,
 }
 
 // ============================================================================
@@ -80,6 +86,10 @@ pub struct FrameRequest {
     pub center_y: f64,
     pub zoom: f64,
     pub max_iterations: u32,
+    #[serde(default)]
+    pub palette: Palette,
+    #[serde(default)]
+    pub colour_interior: bool,
 }
 
 /// Messages from coordinator to client
