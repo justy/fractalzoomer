@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::colour::generate_palette;
+use crate::colour::Palette;
 use crate::mandelbrot::render_strip;
 use crate::messages::*;
 
@@ -28,7 +28,7 @@ impl Worker {
         Self {
             worker_id: uuid::Uuid::new_v4().to_string(),
             coordinator_url,
-            palette: generate_palette(2048),
+            palette: Palette::default().generate(2048),
         }
     }
 
